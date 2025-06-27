@@ -90,10 +90,79 @@ pub fn unpack_i8_to_ternary(
 //   or if specific accumulation (e.g. to i32) is needed before scaling.
 // - Operations that handle the KVCache for attention.
 
+use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as base64_standard};
+
+/// Decodes a Base64 encoded string into a vector of bytes.
+///
+/// # Arguments
+/// * `b64_string`: The Base64 encoded string.
+///
+/// # Returns
+/// * `Result<Vec<u8>>`: A vector of bytes if decoding is successful.
+pub fn decode_base64(b64_string: &str) -> Result<Vec<u8>> {
+    base64_standard.decode(b64_string).context("Failed to decode Base64 string")
+}
+
+/// Reconstructs an ndarray::Array<T, D> from a byte vector and shape information.
+///
+/// This function assumes the byte vector represents tightly packed data of type `T`.
+/// The number of bytes must be consistent with the anzahl of elements and `std::mem::size_of::<T>()`.
+///
+/// # Type Parameters
+/// * `T`: The data type of the array elements (e.g., `f32`, `i8`). Must implement `Clone` and `Default`.
+/// * `D`: The dimensionality of the array (e.g., `Ix1` for `Array1`, `Ix2` for `Array2`).
+///
+/// # Arguments
+/// * `bytes`: A vector of bytes containing the raw tensor data.
+/// * `shape`: A slice representing the desired shape of the array.
+///
+/// # Returns
+/// * `Result<ndarray::Array<T, D>>`: The reconstructed ndarray Array.
+///
+/// # Panics
+/// Panics if the number of bytes does not match the expected size for the given shape and data type.
+pub fn array_from_bytes<T, D>(bytes: Vec<u8>, shape: &[usize]) -> Result<ndarray::Array<T, D>>
+where
+    T: Clone + Default + Copy, // Added Copy as T is likely a primitive
+    D: ndarray::Dimension,
+{
+    let elem_size = std.mem::size_of::<T>();
+    let expected_elements = shape.iter().product::<usize>();
+    let expected_bytes = expected_elements * elem_size;
+
+    if bytes.len() != expected_bytes {
+        return Err(anyhow::anyhow!(
+            "Byte vector length {} does not match expected size {} for shape {:?} and type_size {}",
+            bytes.len(), expected_bytes, shape, elem_size
+        ));
+    }
+
+    // Create an uninitialized array of the correct shape.
+    // Using `unsafe` here is generally discouraged unless absolutely necessary and well-understood.
+    // A safer approach would be to initialize with default values and then fill,
+    // or use a method that directly constructs from a slice of T if available.
+    // For primitives, direct casting from byte slices is possible but needs careful alignment handling.
+
+    // Simpler and safer way for primitives:
+    let mut data_vec: Vec<T> = Vec::with_capacity(expected_elements);
+    // This assumes T is a primitive type where direct casting from chunks of bytes is safe.
+    // This is generally true for f32, i8, etc., on platforms with matching endianness.
+    // The conversion script should ensure data is saved in native endianness or a fixed one.
+    unsafe {
+        data_vec.set_len(expected_elements); // Initialize vec length
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), data_vec.as_mut_ptr() as *mut u8, bytes.len());
+    }
+
+    ndarray::Array::from_shape_vec(D::from_dimension(&ndarray::IxDyn(shape)).context("Invalid shape for ndarray")?, data_vec)
+        .context("Failed to create ndarray from shape and vector")
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::arr2;
+    use ndarray::{arr1, arr2, Array, Ix1, Ix2}; // Added Ix1, Ix2
 
     #[test]
     fn test_unpack_i8_to_ternary_basic() {
@@ -112,14 +181,8 @@ mod tests {
 
     #[test]
     fn test_unpack_i8_to_ternary_multiple_packed_cols() {
-        // Packed1: 33i8 (00100001_bin) -> Ternary [1,0,-1,0] (mistake in manual calc, should be [1,0,1,0] if 00_01_00_01, or [1,0,-1,0] if 00_10_00_01)
-        // Let's use the values from test_quantize_weights_ternary_exact_thresholds
         // Packed1: 33i8 from [0.6, 0.2, -0.6, -0.2] (scale 0.45) -> Ternary [1,0,-1,0]
-        //          (01_bin for 1, 00_bin for 0, 10_bin for -1)
-        //          Packed: (0 << 6) | (-1 << 4) | (0 << 2) | (1 << 0) -> 00_10_00_01 = 33
         // Packed2: 73i8 from [0.5, -0.5, 0.0, 1.0] (scale 0.45) -> Ternary [1,-1,0,1]
-        //          Packed: (1 << 6) | (0 << 4) | (-1 << 2) | (1 << 0) -> 01_00_10_01 = 73
-
         let packed_data = arr2(&[[33i8, 73i8]]);
         let original_ncols = 8;
         let unpacked = unpack_i8_to_ternary(&packed_data.view(), original_ncols);
@@ -149,7 +212,7 @@ mod tests {
     #[test]
     fn test_unpack_i8_to_ternary_all_minus_ones() {
         // Ternary [-1,-1,-1,-1] -> 2-bit [10,10,10,10] -> Packed 10101010_bin = -86 (or 170 as u8)
-        let packed_val = -86i8; // or 170u8 -> 10101010
+        let packed_val = -86i8;
         let packed_data = arr2(&[[packed_val]]);
         let original_ncols = 4;
         let unpacked = unpack_i8_to_ternary(&packed_data.view(), original_ncols);
@@ -159,9 +222,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Invalid 2-bit value '3' encountered during unpacking")]
     fn test_unpack_i8_to_ternary_invalid_pattern() {
-        // Contains 11_bin pattern which is invalid
-        // e.g., 11000000_bin = 192 (u8) or -64 (i8)
-        let packed_data = arr2(&[[-64i8]]);
+        let packed_data = arr2(&[[-64i8]]); // -64 is 11000000_bin, first 2-bit is 00, second is 00, third is 00, fourth is 11.
         unpack_i8_to_ternary(&packed_data.view(), 4);
     }
 
@@ -169,13 +230,72 @@ mod tests {
     #[should_panic(expected = "Packed weights columns 1 does not match original_ncols/4 (3/4)")]
     fn test_unpack_i8_to_ternary_shape_mismatch() {
         let packed_data = arr2(&[[1i8]]);
-        unpack_i8_to_ternary(&packed_data.view(), 3); // original_ncols = 3, so 3/4 = 0. Packed has 1 col.
+        unpack_i8_to_ternary(&packed_data.view(), 3);
     }
 
     #[test]
     fn test_unpack_i8_to_ternary_empty_original_cols() {
-        let packed_data = Array2::<i8>::zeros((2,0)); // If original_ncols is 0, packed_ncols is 0
+        let packed_data = Array2::<i8>::zeros((2,0));
         let unpacked = unpack_i8_to_ternary(&packed_data.view(), 0);
         assert_eq!(unpacked.shape(), &[2,0]);
+    }
+
+    // Tests for new helper functions
+    #[test]
+    fn test_decode_base64_valid() {
+        // "hello" -> aGVsbG8=
+        let b64_str = "aGVsbG8=";
+        let bytes = decode_base64(b64_str).unwrap();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn test_decode_base64_invalid() {
+        let b64_str = "invalid-b64-string";
+        assert!(decode_base64(b64_str).is_err());
+    }
+
+    #[test]
+    fn test_array_from_bytes_f32_1d() {
+        let data_f32: Vec<f32> = vec![1.0, 2.5, -3.0];
+        let mut bytes_vec: Vec<u8> = Vec::new();
+        for val in &data_f32 {
+            bytes_vec.extend_from_slice(&val.to_ne_bytes());
+        }
+
+        let shape = [3];
+        let array: Array<f32, Ix1> = array_from_bytes(bytes_vec, &shape).unwrap();
+        assert_eq!(array, arr1(&data_f32));
+    }
+
+    #[test]
+    fn test_array_from_bytes_i8_2d() {
+        let data_i8: Vec<i8> = vec![1, -2, 3, 4, -5, 6];
+        let bytes_vec: Vec<u8> = data_i8.iter().map(|&x| x as u8).collect();
+
+        let shape = [2,3];
+        let array: Array<i8, Ix2> = array_from_bytes(bytes_vec, &shape).unwrap();
+        let expected_array = arr2(&[[1, -2, 3], [4, -5, 6]]);
+        assert_eq!(array, expected_array);
+    }
+
+    #[test]
+    fn test_array_from_bytes_wrong_size() {
+        let bytes_vec: Vec<u8> = vec![0,0,0,0]; // 4 bytes for one f32
+        let shape = [2]; // Expects 2 f32s (8 bytes)
+        let result: Result<Array<f32, Ix1>> = array_from_bytes(bytes_vec, &shape);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Byte vector length 4 does not match expected size 8"));
+    }
+     #[test]
+    fn test_array_from_bytes_empty() {
+        let bytes_vec: Vec<u8> = vec![];
+        let shape = [0];
+        let array: Array<f32, Ix1> = array_from_bytes(bytes_vec.clone(), &shape).unwrap();
+        assert_eq!(array.len(), 0);
+
+        let shape2d = [2,0];
+        let array2d: Array<f32, Ix2> = array_from_bytes(bytes_vec, &shape2d).unwrap();
+        assert_eq!(array2d.shape(), &[2,0]);
     }
 }
